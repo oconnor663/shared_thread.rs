@@ -31,17 +31,15 @@ impl<T> SharedThread<T> {
 
     pub fn try_join(&self) -> Option<&T> {
         let mut guard = self.thread.lock().unwrap();
-        if let Some(thread) = guard.take() {
+        if let Some(thread) = &*guard {
             if thread.is_finished() {
                 // Joining will not block in this case, and we can do it while holding the Mutex.
-                let result = thread.join();
-                // It's not possible for a .join() thread to be waiting on the Condvar at this
-                // point, because that thread would have .take()n the thread handle.
-                debug_assert!(self.result.get().is_none());
-                _ = self.result.set(result.expect("shared thread panicked"));
-            } else {
-                // The thread is likely to block if we join it. Put it back.
-                *guard = Some(thread);
+                let result = guard
+                    .take()
+                    .expect("already checked not None")
+                    .join()
+                    .expect("shared thread panicked");
+                self.result.set(result).ok().expect("should be unset")
             }
         }
         self.result.get()
@@ -50,16 +48,26 @@ impl<T> SharedThread<T> {
     pub fn join(&self) -> &T {
         let mut guard = self.thread.lock().unwrap();
         if let Some(thread) = guard.take() {
-            // It's our job to block on join(). Release the mutex while we block, so that we don't
-            // interfere with calls to Self::try_join in the meantime.
+            // To avoid a race condition (see test_join_try_join_race), first do a non-blocking
+            // check while holding the lock.
+            if thread.is_finished() {
+                // The thread has already exited. JoinHandle::join will not block for long. We were
+                // the first blocking waiter, so there's no need to notify the condvar.
+                let result = thread.join().expect("shared thread panicked");
+                self.result.set(result).ok().expect("should be unest");
+                return self.result.get().unwrap();
+            }
+            // The thread hasn't finished, and it's our job to block on join(). Release the mutex
+            // while we block, so that we don't interfere with calls to Self::try_join in the
+            // meantime.
             drop(guard);
-            let result = thread.join();
+            let maybe_result = thread.join();
             // Retake the mutex so that notify_all() and wait() don't race.
             guard = self.thread.lock().unwrap();
             self.condvar.notify_all();
-            debug_assert!(self.result.get().is_none());
-            _ = self.result.set(result.expect("shared thread panicked"));
-            drop(guard);
+            let result = maybe_result.expect("shared thread panicked");
+            self.result.set(result).ok().expect("should be unest");
+            drop(guard); // suppress a value-not-read warning
             return self.result.get().unwrap();
         }
         // Either another thread has already joined, in which case the result will be populated, or
@@ -177,7 +185,7 @@ mod test {
         let mut iterations = 1u64;
         loop {
             // Start a thread that will finish immediately.
-            let shared_thread = SharedThread::new(std::thread::spawn(|| ()));
+            let shared_thread = SharedThread::spawn(|| ());
             // Wait for the thread to finish, without updating the SharedChild state.
             while !shared_thread
                 .thread
