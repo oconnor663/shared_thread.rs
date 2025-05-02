@@ -1,3 +1,11 @@
+//! This crate provides [`SharedThread`], a wrapper around
+//! [`std::thread::JoinHandle`](https://doc.rust-lang.org/std/thread/struct.JoinHandle.html) that
+//! lets multiple threads wait on a shared thread and read its output.
+//!
+//! For example code, see [the `SharedThread` example](struct.SharedThread.html#example).
+
+#![deny(unsafe_code)]
+
 use std::fmt;
 use std::mem;
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
@@ -23,8 +31,60 @@ impl<T> fmt::Debug for State<T> {
 
 use State::*;
 
-/// A wrapper around std::thread::JoinHandle that allows for multiple joiners. Most methods take
-/// `&self` and implicitly propagate panics from the shared thread.
+/// A wrapper around [`JoinHandle`](https://doc.rust-lang.org/std/thread/struct.JoinHandle.html)
+/// that allows for multiple waiters.
+///
+/// # Example
+///
+/// ```
+/// use shared_thread::SharedThread;
+/// use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+///
+/// // Use this flag to tell our shared thread when to stop.
+/// static EXIT_FLAG: AtomicBool = AtomicBool::new(false);
+///
+/// // Start a background thread that we'll share with several waiting threads.
+/// let shared_thread = SharedThread::spawn(|| {
+///     // Pretend this is some expensive, useful background work...
+///     while (!EXIT_FLAG.load(Relaxed)) {}
+///
+///     42
+/// });
+///
+/// // How to share a SharedThread object with other threads is up to you. In this sense it's like
+/// // any other object you might need to share, like say a HashMap or a File. The common options
+/// // are to put it in an Arc, or to let "scoped" threads borrow it directly. Let's use scoped
+/// // threads.
+/// std::thread::scope(|scope| {
+///     // Spawn three waiter threads that each wait on the shared thread.
+///     let waiter1 = scope.spawn(|| shared_thread.join());
+///     let waiter2 = scope.spawn(|| shared_thread.join());
+///     let waiter3 = scope.spawn(|| shared_thread.join());
+///
+///     // In this example, the shared thread is going to keep looping until we set the EXIT_FLAG.
+///     // In the meantime, .is_finished() returns false, and .try_join() returns None.
+///     assert!(!shared_thread.is_finished());
+///     assert_eq!(shared_thread.try_join(), None);
+///
+///     // Ask the shared thread to stop looping.
+///     EXIT_FLAG.store(true, Relaxed);
+///
+///     // At this point the calls to .join() above will return quickly, and each of the waiter
+///     // threads will get a reference to the shared thread's output, &42.
+///     assert_eq!(*waiter1.join().unwrap(), 42);
+///     assert_eq!(*waiter2.join().unwrap(), 42);
+///     assert_eq!(*waiter3.join().unwrap(), 42);
+///
+///     // Now that the shared thread has finished, .is_finished() returns true, and .try_join()
+///     // returns Some(&42).
+///     assert!(shared_thread.is_finished());
+///     assert_eq!(*shared_thread.try_join().unwrap(), 42);
+/// });
+///
+///  // We can take ownership of the output by consuming the SharedThread object. As with any
+///  // non-Copy type in Rust, this requires that the SharedThread is not borrowed.
+///  assert_eq!(shared_thread.into_output(), 42);
+/// ```
 #[derive(Debug)]
 pub struct SharedThread<T> {
     state: Mutex<State<T>>,
