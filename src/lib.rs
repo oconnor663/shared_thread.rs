@@ -288,11 +288,12 @@ mod test {
             // try_join will always return None here.
             for _ in 0..100 {
                 assert!(bg_thread.try_join().is_none());
+                assert!(!bg_thread.is_finished());
             }
             STOP_FLAG.store(true, Relaxed);
             // One of the joiner threads almost certainly has the underlying thread handle, and
             // eventually it'll set SharedThread::result and one of these try_joins will return Some.
-            while bg_thread.try_join().is_none() {}
+            while !bg_thread.is_finished() {}
             assert_eq!(bg_thread.try_join(), Some(&42));
         });
     }
