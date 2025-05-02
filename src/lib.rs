@@ -31,8 +31,18 @@ impl<T> fmt::Debug for State<T> {
 
 use State::*;
 
-/// A wrapper around [`JoinHandle`](https://doc.rust-lang.org/std/thread/struct.JoinHandle.html)
-/// that allows for multiple waiters.
+/// A wrapper around [`std::thread::JoinHandle`] that allows for multiple waiters.
+///
+/// The high-level differences between `SharedThread` and [`JoinHandle`] are:
+///
+/// - [`join`][SharedThread::join] takes `&self` rather than `&mut self`.
+/// - [`join`][SharedThread::join] returns `&T` rather than `T`. For taking ownership of `T`, see
+///   [`into_output`][SharedThread::into_output].
+/// - `SharedThread` provides [`try_join`][SharedThread::try_join].
+/// - Rather than converting panics in into
+///   [`std::thread::Result`](https://doc.rust-lang.org/std/thread/type.Result.html), which usually
+///   requires the caller to `.unwrap()` every `.join()`, `SharedThread` propagates panics
+///   automatically.
 ///
 /// # Example
 ///
@@ -85,6 +95,9 @@ use State::*;
 ///  // non-Copy type in Rust, this requires that the SharedThread is not borrowed.
 ///  assert_eq!(shared_thread.into_output(), 42);
 /// ```
+///
+/// [`std::thread::JoinHandle`]: https://doc.rust-lang.org/std/thread/struct.JoinHandle.html
+/// [`JoinHandle`]: https://doc.rust-lang.org/std/thread/struct.JoinHandle.html
 #[derive(Debug)]
 pub struct SharedThread<T> {
     state: Mutex<State<T>>,
@@ -94,6 +107,12 @@ pub struct SharedThread<T> {
 
 impl<T: Send + 'static> SharedThread<T> {
     /// Spawn a new `SharedThread`.
+    ///
+    /// # Panics
+    ///
+    /// This function calls
+    /// [`std::thread::spawn`](https://doc.rust-lang.org/std/thread/fn.spawn.html) internally,
+    /// which panics if it fails to spawn a thread.
     pub fn spawn<F>(f: F) -> Self
     where
         F: FnOnce() -> T + Send + 'static,
@@ -106,6 +125,8 @@ impl<T: Send + 'static> SharedThread<T> {
 impl<T> SharedThread<T> {
     /// Wrap an existing
     /// [`JoinHandle`](https://doc.rust-lang.org/std/thread/struct.JoinHandle.html).
+    ///
+    /// This is equivalent to [`SharedThread::from`].
     pub fn new(handle: thread::JoinHandle<T>) -> Self {
         SharedThread {
             state: Mutex::new(Started(handle)),
@@ -226,9 +247,9 @@ impl<T> SharedThread<T> {
         self.output.get().expect("must be set")
     }
 
-    /// Wait for the shared thread to finish, then return `T`. This requires ownership of the
-    /// `SharedThread` and consumes it. This blocks the current thread until the shared thread is
-    /// finished.
+    /// Wait for the shared thread to finish, then return `T`. This blocks the current thread until
+    /// the shared thread is finished. This requires ownership of the `SharedThread` and consumes
+    /// it.
     ///
     /// # Panics
     ///
@@ -246,7 +267,8 @@ impl<T> SharedThread<T> {
     ///
     /// # Panics
     ///
-    /// This function panics if the shared thread panicked.
+    /// This function may panic if the shared thread panicked. Currently it only panics if another
+    /// method has already panicked, but this is not guaranteed.
     pub fn is_finished(&self) -> bool {
         match &*self.state.lock().unwrap() {
             Started(handle) => handle.is_finished(),
