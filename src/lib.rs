@@ -98,6 +98,38 @@ struct ExitSignal {
     condvar: Condvar,
 }
 
+impl ExitSignal {
+    fn new() -> Self {
+        ExitSignal {
+            mutex: Mutex::new(false),
+            condvar: Condvar::new(),
+        }
+    }
+
+    fn wrap_closure<F, T>(self: Arc<Self>, f: F) -> impl FnOnce() -> T + Send + 'static
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        move || {
+            // Whether or not the closure `f` panics, set the exited flag and notify the condvar.
+            // It's not clear to me that the concept of "unwind safety" in the standard library was
+            // a good indea, but at least it doesn't require any unsafe code to work around it.
+            let unwind_result = catch_unwind(AssertUnwindSafe(f));
+            let mut guard = lock_ignoring_poison(&self.mutex);
+            *guard = true;
+            self.condvar.notify_all();
+            // Now that we've signaled that we're exiting, if there was a panic, propagate it. The
+            // first waiter thread will observe it. (Subsequent waiter threads will only see the
+            // Panicked state variant.)
+            match unwind_result {
+                Ok(return_value) => return_value,
+                Err(panic) => resume_unwind(panic),
+            }
+        }
+    }
+}
+
 enum State<T> {
     Running(thread::JoinHandle<T>),
     // Note that the return value T goes in the OnceLock. If it lived here in the Exited variant,
@@ -123,39 +155,47 @@ impl<T: Send + 'static> SharedThread<T> {
     ///
     /// # Panics
     ///
-    /// This function calls
-    /// [`std::thread::spawn`](https://doc.rust-lang.org/std/thread/fn.spawn.html) internally,
-    /// which panics if it fails to spawn a thread.
+    /// This function calls [`std::thread::spawn`], which panics if it fails to spawn a thread.
     pub fn spawn<F>(f: F) -> Self
     where
         F: FnOnce() -> T + Send + 'static,
     {
-        let exit_signal = Arc::new(ExitSignal {
-            mutex: Mutex::new(false),
-            condvar: Condvar::new(),
-        });
-        let exit_signal_clone = Arc::clone(&exit_signal);
-        let handle = thread::spawn(move || {
-            // Whether or not the closure `f` panics, set the exited flag and notify the condvar.
-            // It's not clear to me that the concept of "unwind safety" in the standard library was
-            // a good indea, but at least it doesn't require any unsafe code to work around it.
-            let unwind_result = catch_unwind(AssertUnwindSafe(f));
-            let mut guard = lock_ignoring_poison(&exit_signal_clone.mutex);
-            *guard = true;
-            exit_signal_clone.condvar.notify_all();
-            // Now that we've signaled exit, if there was a panic, propagate it. The first waiter
-            // thread will observe it. (Subsequent waiter threads will only see the Panicked state
-            // variant.)
-            match unwind_result {
-                Ok(return_value) => return_value,
-                Err(panic) => resume_unwind(panic),
-            }
-        });
+        let exit_signal = Arc::new(ExitSignal::new());
+        let handle = thread::spawn(Arc::clone(&exit_signal).wrap_closure(f));
         SharedThread {
             state: Mutex::new(Running(handle)),
             exit_signal,
             output: OnceLock::new(),
         }
+    }
+
+    /// Spawn a new `SharedThread` by taking ownership of a [`std::thread::Builder`].
+    ///
+    /// # Errors
+    ///
+    /// Unlike the [`spawn`][Self::spawn] function, this function yields an `io::Result` to capture
+    /// any failure to create the thread at the OS level.
+    ///
+    /// # Panics
+    ///
+    /// This function calls [`Builder::spawn`], which returns IO errors for most failures but does
+    /// panic if the configured [`name`] is invalid.
+    ///
+    /// [`Builder::spawn`]: https://doc.rust-lang.org/std/thread/struct.Builder.html#method.spawn
+    /// [`name`]: https://doc.rust-lang.org/std/thread/struct.Builder.html#method.name
+    pub fn spawn_with<SPAWNER, E, F>(spawner: SPAWNER, f: F) -> Result<Self, E>
+    where
+        SPAWNER:
+            FnOnce(Box<dyn FnOnce() -> T + Send + 'static>) -> Result<thread::JoinHandle<T>, E>,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let exit_signal = Arc::new(ExitSignal::new());
+        let handle = spawner(Box::new(Arc::clone(&exit_signal).wrap_closure(f)))?;
+        Ok(SharedThread {
+            state: Mutex::new(Running(handle)),
+            exit_signal,
+            output: OnceLock::new(),
+        })
     }
 }
 
@@ -465,5 +505,11 @@ mod test {
             second_panic_error.downcast_ref(),
             Some(&"shared thread panicked"),
         );
+    }
+
+    #[test]
+    fn test_spawn_builder() {
+        let thread = SharedThread::spawn_with(|f| thread::Builder::new().spawn(f), || 42).unwrap();
+        assert_eq!(thread.into_output(), 42);
     }
 }
