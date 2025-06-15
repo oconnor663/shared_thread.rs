@@ -1,6 +1,6 @@
 //! This crate provides [`SharedThread`], a wrapper around
 //! [`std::thread::JoinHandle`](https://doc.rust-lang.org/std/thread/struct.JoinHandle.html) that
-//! lets multiple threads wait on a shared thread and read its output.
+//! lets multiple threads wait on a shared thread and read its output, with an optional timeout.
 //!
 //! For example code, see [the `SharedThread` example](struct.SharedThread.html#example).
 
@@ -8,28 +8,12 @@
 
 use std::fmt;
 use std::mem;
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::sync::MutexGuard;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
-
-enum State<T> {
-    Started(thread::JoinHandle<T>),
-    Joining,
-    Joined,
-    Panicked,
-}
-
-impl<T> fmt::Debug for State<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Started(_) => write!(f, "Started"),
-            Joining => write!(f, "Joining"),
-            Joined => write!(f, "Joined"),
-            Panicked => write!(f, "Panicked"),
-        }
-    }
-}
-
-use State::*;
+use std::time::Duration;
+use std::time::Instant;
 
 /// A wrapper around [`std::thread::JoinHandle`] that allows for multiple waiters.
 ///
@@ -38,7 +22,8 @@ use State::*;
 /// - [`join`][SharedThread::join] takes `&self` rather than `&mut self`.
 /// - [`join`][SharedThread::join] returns `&T` rather than `T`. For taking ownership of `T`, see
 ///   [`into_output`][SharedThread::into_output].
-/// - `SharedThread` provides [`try_join`][SharedThread::try_join].
+/// - `SharedThread` also provides [`join_timeout`][Self::join_timeout],
+///   [`join_deadline`][Self::join_deadline], and [`try_join`][SharedThread::try_join].
 /// - Rather than converting panics in into
 ///   [`std::thread::Result`](https://doc.rust-lang.org/std/thread/type.Result.html), which usually
 ///   requires the caller to `.unwrap()` every `.join()`, `SharedThread` propagates panics
@@ -61,10 +46,10 @@ use State::*;
 ///     42
 /// });
 ///
-/// // How to share a SharedThread object with other threads is up to you. In this sense it's like
-/// // any other object you might need to share, like say a HashMap or a File. The common options
-/// // are to put it in an Arc, or to let "scoped" threads borrow it directly. Let's use scoped
-/// // threads.
+/// // It's up to you how to share the SharedThread object with other threads. In this sense it's
+/// // like any other object you might need to share, like say a HashMap or a File. The common
+/// // options are to put it in an Arc, or to let "scoped" threads borrow it directly. Let's use
+/// // scoped threads.
 /// std::thread::scope(|scope| {
 ///     // Spawn three waiter threads that each wait on the shared thread.
 ///     let waiter1 = scope.spawn(|| shared_thread.join());
@@ -79,8 +64,8 @@ use State::*;
 ///     // Ask the shared thread to stop looping.
 ///     EXIT_FLAG.store(true, Relaxed);
 ///
-///     // At this point the calls to .join() above will return quickly, and each of the waiter
-///     // threads will get a reference to the shared thread's output, &42.
+///     // Now all the calls to .join() above will return quickly, and each of the waiter threads
+///     // will get a reference to the shared thread's output, &42.
 ///     assert_eq!(*waiter1.join().unwrap(), 42);
 ///     assert_eq!(*waiter2.join().unwrap(), 42);
 ///     assert_eq!(*waiter3.join().unwrap(), 42);
@@ -101,8 +86,36 @@ use State::*;
 #[derive(Debug)]
 pub struct SharedThread<T> {
     state: Mutex<State<T>>,
-    condvar: Condvar,
+    exit_signal: Arc<ExitSignal>,
     output: OnceLock<T>,
+}
+
+// The shared thread sets this bool to true and signals the condvar when it exits, even if it
+// panicks.
+#[derive(Debug)]
+struct ExitSignal {
+    mutex: Mutex<bool>,
+    condvar: Condvar,
+}
+
+enum State<T> {
+    Running(thread::JoinHandle<T>),
+    // Note that the return value T goes in the OnceLock. If it lived here in the Exited variant,
+    // it would be stuck inside the state Mutex, and we couldn't share it with simple references.
+    Exited,
+    Panicked,
+}
+
+use State::*;
+
+impl<T> fmt::Debug for State<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Running { .. } => write!(f, "Running"),
+            Exited => write!(f, "Exited"),
+            Panicked => write!(f, "Panicked"),
+        }
+    }
 }
 
 impl<T: Send + 'static> SharedThread<T> {
@@ -117,143 +130,152 @@ impl<T: Send + 'static> SharedThread<T> {
     where
         F: FnOnce() -> T + Send + 'static,
     {
-        Self::new(thread::spawn(f))
+        let exit_signal = Arc::new(ExitSignal {
+            mutex: Mutex::new(false),
+            condvar: Condvar::new(),
+        });
+        let exit_signal_clone = Arc::clone(&exit_signal);
+        let handle = thread::spawn(move || {
+            // Whether or not the closure `f` panics, set the exited flag and notify the condvar.
+            // It's not clear to me that the concept of "unwind safety" in the standard library was
+            // a good indea, but at least it doesn't require any unsafe code to work around it.
+            let unwind_result = catch_unwind(AssertUnwindSafe(f));
+            let mut guard = lock_ignoring_poison(&exit_signal_clone.mutex);
+            *guard = true;
+            exit_signal_clone.condvar.notify_all();
+            // Now that we've signaled exit, if there was a panic, propagate it. The first waiter
+            // thread will observe it. (Subsequent waiter threads will only see the Panicked state
+            // variant.)
+            match unwind_result {
+                Ok(return_value) => return_value,
+                Err(panic) => resume_unwind(panic),
+            }
+        });
+        SharedThread {
+            state: Mutex::new(Running(handle)),
+            exit_signal,
+            output: OnceLock::new(),
+        }
     }
 }
 
 // A thread that multiple other threads can wait on simultaneously.
 impl<T> SharedThread<T> {
-    /// Wrap an existing
-    /// [`JoinHandle`](https://doc.rust-lang.org/std/thread/struct.JoinHandle.html).
-    ///
-    /// This is equivalent to [`SharedThread::from`].
-    pub fn new(handle: thread::JoinHandle<T>) -> Self {
-        SharedThread {
-            state: Mutex::new(Started(handle)),
-            condvar: Condvar::new(),
-            output: OnceLock::new(),
-        }
-    }
+    fn join_exited_thread(&self, exit_signal_guard: MutexGuard<bool>) -> &T {
+        // It's not really important that we pass down the exit_signal_guard here, but it would
+        // probably live across this call anway, so it seems cleaner to take ownership of it.
+        debug_assert!(*exit_signal_guard, "the thread exited");
 
-    // .join() and .try_join() both call this when it's clear that they need to join the child (as
-    // opposed to sleeping while some other thread does it, or returning None). The incoming state
-    // must be Started. The state might transition through Joining, but the end state is guaranteed
-    // to be either Joined or Panicked.
-    fn do_blocking_join(&self, mut state_guard: MutexGuard<State<T>>) {
-        // Use the Panicked state as a placeholder, so that that's the state we leave behind if
-        // something does in fact panic. This makes the Panicked state kind of ambiguous between
-        // "the other thread panicked" or "we failed an assert somewhere", but at least the initial
-        // panic backtrace will make it clear what happened.
-        let Started(handle) = mem::replace(&mut *state_guard, Panicked) else {
-            panic!("unexpected shared thread state: {:?}", *state_guard);
-        };
-
-        // If we released the lock in the Joining state, that would make any calls to .try_join()
-        // return None until we reacquired the lock and cleaned up. That's fine if the thread is
-        // still running, or if it's exiting "now-ish" (i.e. an "honest" race), but it's not fine
-        // if the thread actually exited long ago. To avoid that race condition, we need to check
-        // on the thread *before* we release the lock. (See test_join_try_join_race.)
-        if handle.is_finished() {
-            // The thread has already exited. JoinHandle::join will not block for long, and we do
-            // it with the state lock held. In this case we know there are no other waiting
-            // threads, and there's no need to notify the condvar.
-            let output = handle.join().expect("shared thread panicked");
-            self.output.set(output).ok().expect("should be empty");
-            *state_guard = Joined;
-            return;
-        }
-
-        // The thread is still running (or at least, it was running until very recently). We're
-        // going to do a potentially long-blocking join, and we need to release the lock while we
-        // do this, so that calls to .try_join() in the meantime can observe the Joining state and
-        // return None without blocking. After entering the Joining state, we *must* exit that
-        // state and signal the condvar before returning, or else other threads might block
-        // forever. No short-circuiting in this "critical section".
-        *state_guard = Joining;
-        drop(state_guard);
-
-        // Do the blocking join. We're not allowed to panic here.
-        let result = handle.join();
-
-        // Reacquire the state lock, set the Panicked state again (so that, like in the beginning,
-        // that's what we're left with if the other thread panicked or if something else panics
-        // below), and signal the condvar. We're still in the critical section, so we suppress
-        // Mutex poisoning.
-        let mut state_guard = match self.state.lock() {
-            Ok(guard) => guard,
-            Err(poisoned_guard) => poisoned_guard.into_inner(),
-        };
-        *state_guard = Panicked;
-        self.condvar.notify_all();
-
-        // *Now* we're out of the critical section, and panicking is ok again. Clean up.
-        let output = result.expect("the shared thread panicked");
-        self.output.set(output).ok().expect("should be empty");
-        *state_guard = Joined;
-    }
-
-    /// Return `Some(&T)` if the shared thread has already finished, otherwise `None`. This never
-    /// blocks.
-    ///
-    /// # Panics
-    ///
-    /// This function panics if the shared thread panicked.
-    pub fn try_join(&self) -> Option<&T> {
-        let state_guard = self.state.lock().unwrap();
+        let mut state_guard = lock_ignoring_poison(&self.state);
         match &*state_guard {
-            // If the thread has already exited, we can join it ourselves. Otherwise return None,
-            // to avoid blocking.
-            Started(handle) => {
-                if handle.is_finished() {
-                    self.do_blocking_join(state_guard);
-                } else {
-                    return None;
-                }
+            // Running means we're the thread that needs to .join(). Fall through.
+            Running(_) => {}
+            // Exited or Panicked means someone already joined.
+            Exited => return self.output.get().unwrap(),
+            Panicked => panic!("shared thread panicked"),
+        };
+
+        // We need to .join(), so take the JoinHandle by value. Use the Panicked state as a
+        // placeholder, so that it's the state we leave behind if something does in fact panic.
+        // This makes the Panicked state kind of ambiguous between "the other thread panicked" or
+        // "we failed an assert somewhere", but at least the initial panic backtrace will make it
+        // clear what happened.
+        let Running(handle) = mem::replace(&mut *state_guard, Panicked) else {
+            unreachable!()
+        };
+
+        // The thread has signaled that it's exiting, so .join() will return quickly. (It might
+        // block briefly it the thread is still cleaning itself up.) If it panicked, propagate the
+        // panic.
+        match handle.join() {
+            Ok(return_value) => {
+                // Because we set `output` while we hold the state mutex, it's guaranteed that
+                // subsequent threads that see the Exited state will also see that `output` is set.
+                let set_result = self.output.set(return_value);
+                assert!(set_result.is_ok(), "output must be previously unset");
+                *state_guard = Exited;
+                self.output.get().unwrap()
             }
-            // Because we know .do_blocking_join() checked .is_finished() before blocking, we can
-            // short-circuit here without worrying about a race condition.
-            Joining => return None,
-            // Just fall through.
-            Joined => (),
-            // Re-panic.
-            Panicked => panic!("something panicked earlier"),
+            Err(panic) => resume_unwind(panic),
         }
-        debug_assert!(self.output.get().is_some());
-        self.output.get()
     }
 
-    /// Wait for the shared thread to finish, then return `&T`. This blocks the current thread
-    /// until the shared thread is finished.
+    /// Wait for the shared thread to finish, then return `&T`. This blocks the current thread.
     ///
     /// # Panics
     ///
-    /// This function panics if the shared thread panicked.
+    /// This function panics if the shared thread panicked. The original panic is propagated
+    /// directly with [`resume_unwind`](https://doc.rust-lang.org/std/panic/fn.resume_unwind.html)
+    /// the first time. Subsequent calls panic with a generic message.
     pub fn join(&self) -> &T {
-        let mut state_guard = self.state.lock().unwrap();
-        match *state_guard {
-            // Joing the other thread ourselves.
-            Started(_) => self.do_blocking_join(state_guard),
-            // Sleep while another thread joins.
-            Joining => {
-                while matches!(*state_guard, Joining) {
-                    state_guard = self.condvar.wait(state_guard).unwrap();
-                }
-            }
-            // Just fall through.
-            Joined => (),
-            // Re-panic.
-            Panicked => panic!("something panicked earlier"),
+        let mut exit_signal_guard = lock_ignoring_poison(&self.exit_signal.mutex);
+        while !*exit_signal_guard {
+            exit_signal_guard = wait_ignoring_poison(&self.exit_signal.condvar, exit_signal_guard);
         }
-        self.output.get().expect("must be set")
+        self.join_exited_thread(exit_signal_guard)
     }
 
-    /// Wait for the shared thread to finish, then return `T`. This blocks the current thread until
-    /// the shared thread is finished. This requires ownership of the `SharedThread` and consumes
-    /// it.
+    /// Wait with a timeout for the shared thread to finish. If it finishes in time (or it already
+    /// finished), return `Some(&T)`, otherwise return `None`. This blocks the current thread.
     ///
     /// # Panics
     ///
-    /// This function panics if the shared thread panicked.
+    /// This function panics if the shared thread panicked. The original panic is propagated
+    /// directly with [`resume_unwind`](https://doc.rust-lang.org/std/panic/fn.resume_unwind.html)
+    /// the first time it's observed. Subsequent calls panic with a generic message.
+    pub fn join_timeout(&self, timeout: Duration) -> Option<&T> {
+        let deadline = Instant::now() + timeout;
+        self.join_deadline(deadline)
+    }
+
+    /// Wait with a deadline for the shared thread to finish. If it finishes in time (or it already
+    /// finished), return `Some(&T)`, otherwise return `None`. This blocks the current thread.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if the shared thread panicked. The original panic is propagated
+    /// directly with [`resume_unwind`](https://doc.rust-lang.org/std/panic/fn.resume_unwind.html)
+    /// the first time it's observed. Subsequent calls panic with a generic message.
+    pub fn join_deadline(&self, deadline: Instant) -> Option<&T> {
+        let mut exit_signal_guard = lock_ignoring_poison(&self.exit_signal.mutex);
+        while !*exit_signal_guard {
+            if Instant::now() > deadline {
+                return None;
+            }
+            exit_signal_guard = wait_deadline_ignoring_poison(
+                &self.exit_signal.condvar,
+                exit_signal_guard,
+                deadline,
+            );
+        }
+        Some(self.join_exited_thread(exit_signal_guard))
+    }
+
+    /// Return `Some(&T)` if the shared thread has already finished, otherwise `None`. This always
+    /// returns quickly.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if the shared thread panicked. The original panic is propagated
+    /// directly with [`resume_unwind`](https://doc.rust-lang.org/std/panic/fn.resume_unwind.html)
+    /// the first time it's observed. Subsequent calls panic with a generic message.
+    pub fn try_join(&self) -> Option<&T> {
+        let exit_signal_guard = lock_ignoring_poison(&self.exit_signal.mutex);
+        if *exit_signal_guard {
+            Some(self.join_exited_thread(exit_signal_guard))
+        } else {
+            None
+        }
+    }
+
+    /// Wait for the shared thread to finish, then return `T`. This blocks the current. This
+    /// requires ownership of the `SharedThread` and consumes it.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if the shared thread panicked. The original panic is propagated
+    /// directly with [`resume_unwind`](https://doc.rust-lang.org/std/panic/fn.resume_unwind.html)
+    /// the first time it's observed. Subsequent calls panic with a generic message.
     pub fn into_output(self) -> T {
         self.join();
         self.output.into_inner().expect("should be set")
@@ -261,29 +283,40 @@ impl<T> SharedThread<T> {
 
     /// Return `true` if the shared thread has finished, `false` otherwise.
     ///
-    /// This function never blocks. If it returns `true`, [`try_join`][SharedThread::try_join] is
-    /// guaranteed to return `Some(T)`, and [`join`][SharedThread::join] is guaranteed to return
-    /// quickly.
-    ///
-    /// # Panics
-    ///
-    /// This function may panic if the shared thread panicked. Currently it only panics if another
-    /// method has already panicked, but this is not guaranteed.
+    /// This function never blocks. If it returns `true`, [`try_join`][Self::try_join],
+    /// [`join_timeout`][Self::join_timeout], and [`join_deadline`][Self::join_deadline] are
+    /// guaranteed not to return `None`, and all join functions are guaranteed to return quickly.
     pub fn is_finished(&self) -> bool {
-        match &*self.state.lock().unwrap() {
-            Started(handle) => handle.is_finished(),
-            // Because we know .do_blocking_join() checked .is_finished() before blocking, we don't
-            // have to worry about a race condition here.
-            Joining => false,
-            Joined => true,
-            Panicked => panic!("something panicked earlier"),
-        }
+        *lock_ignoring_poison(&self.exit_signal.mutex)
     }
 }
 
-impl<T> From<thread::JoinHandle<T>> for SharedThread<T> {
-    fn from(handle: thread::JoinHandle<T>) -> Self {
-        Self::new(handle)
+fn lock_ignoring_poison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(e) => e.into_inner(),
+    }
+}
+
+fn wait_ignoring_poison<'guard, T>(
+    condvar: &Condvar,
+    guard: MutexGuard<'guard, T>,
+) -> MutexGuard<'guard, T> {
+    match condvar.wait(guard) {
+        Ok(guard) => guard,
+        Err(e) => e.into_inner(),
+    }
+}
+
+fn wait_deadline_ignoring_poison<'guard, T>(
+    condvar: &Condvar,
+    guard: MutexGuard<'guard, T>,
+    deadline: Instant,
+) -> MutexGuard<'guard, T> {
+    let timeout = deadline.saturating_duration_since(Instant::now());
+    match condvar.wait_timeout(guard, timeout) {
+        Ok((guard, _)) => guard,
+        Err(e) => e.into_inner().0,
     }
 }
 
@@ -338,10 +371,9 @@ mod test {
     }
 
     #[test]
-    fn test_from_and_into_inner() {
-        let thread = thread::spawn(|| String::from("foo"));
-        let shared: SharedThread<String> = thread.into();
-        let result: String = shared.into_output();
+    fn test_into_inner() {
+        let thread = SharedThread::spawn(|| String::from("foo"));
+        let result: String = thread.into_output();
         assert_eq!(result, "foo");
     }
 
@@ -381,8 +413,8 @@ mod test {
             let shared_thread = SharedThread::spawn(|| ());
             // Wait for the thread to finish, without updating the SharedChild state.
             {
-                let state_guard = shared_thread.state.lock().unwrap();
-                let Started(handle) = &*state_guard else {
+                let state_guard = lock_ignoring_poison(&shared_thread.state);
+                let Running(handle) = &*state_guard else {
                     unreachable!()
                 };
                 while !handle.is_finished() {}
@@ -420,5 +452,18 @@ mod test {
                 return;
             }
         }
+    }
+
+    #[test]
+    fn test_panic_messages() {
+        let thread = SharedThread::spawn(|| panic!("original message"));
+        let panic_error = catch_unwind(|| thread.join()).unwrap_err();
+        assert_eq!(panic_error.downcast_ref(), Some(&"original message"));
+
+        let second_panic_error = catch_unwind(|| thread.join()).unwrap_err();
+        assert_eq!(
+            second_panic_error.downcast_ref(),
+            Some(&"shared thread panicked"),
+        );
     }
 }
