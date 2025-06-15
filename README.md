@@ -2,4 +2,5 @@
 
 This crate provides `SharedThread`, a wrapper around
 [`std::thread::JoinHandle`](https://doc.rust-lang.org/std/thread/struct.JoinHandle.html)
-that lets multiple threads wait on a shared thread and read its output.
+that lets multiple threads wait on a shared thread and read its output, with an
+optional timeout.
