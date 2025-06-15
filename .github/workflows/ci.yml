@@ -10,8 +10,6 @@ on:
 env:
   RUSTFLAGS: "-D warnings"
   RUST_BACKTRACE: "1"
-  # Set a very long test duration for test_join_try_join_race.
-  RACE_TEST_SECONDS: 60
 
 jobs:
   cargo_tests:
